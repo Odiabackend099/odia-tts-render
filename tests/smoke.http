@@ -1,0 +1,13 @@
+### Health
+GET http://localhost:8000/health
+
+### Speak
+GET http://localhost:8000/speak?text=Hello%20world
+
+### Agent (echo)
+POST http://localhost:8000/agent
+Content-Type: application/json
+
+{
+  "message": "Hello"
+}
