@@ -1,15 +1,17 @@
 services:
   - type: web
-    name: odia-tts
+    name: odia-tts-render
     env: python
-    plan: free
+    plan: starter
+    region: oregon
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     envVars:
+      - key: ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: TTS_VOICE
+        value: en-NG-EzinneNeural
       - key: OPENAI_API_KEY
         sync: false
-      - key: DEFAULT_VOICE
-        value: en-NG-EzinneNeural
-      - key: RATE_LIMIT_PER_MIN
-        value: "60"
-    healthCheckPath: /health

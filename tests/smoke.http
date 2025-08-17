@@ -1,13 +1,11 @@
 ### Health
-GET http://localhost:8000/health
+GET https://odia-tts-render.onrender.com/health
 
 ### Speak
-GET http://localhost:8000/speak?text=Hello%20world
+GET https://odia-tts-render.onrender.com/speak?text=Hello%20Naija&voice=en-NG-EzinneNeural
 
-### Agent (echo)
-POST http://localhost:8000/agent
+### Agent
+POST https://odia-tts-render.onrender.com/agent
 Content-Type: application/json
 
-{
-  "message": "Hello"
-}
+{ "message": "Say welcome in Nigerian English." }

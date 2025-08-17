@@ -1,0 +1,14 @@
+HTTP/1.1 200 OK
+Date: Sat, 16 Aug 2025 21:40:32 GMT
+Content-Type: audio/mpeg
+Transfer-Encoding: chunked
+Connection: keep-alive
+Cache-Control: no-store
+content-disposition: inline; filename="speech.mp3"
+rndr-id: c63b22e2-19e5-4fd0
+x-render-origin-server: uvicorn
+cf-cache-status: DYNAMIC
+Server: cloudflare
+CF-RAY: 97041731feb35f17-LHR
+alt-svc: h3=":443"; ma=86400
+

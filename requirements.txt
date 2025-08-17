@@ -3,3 +3,4 @@ uvicorn[standard]==0.30.6
 edge-tts==6.1.12
 openai==1.43.0
 python-dotenv==1.1.1
+httpx==0.25.0
