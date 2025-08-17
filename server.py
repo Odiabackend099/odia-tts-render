@@ -1,4 +1,4 @@
-# server.py — ODIA TTS Production Server
+# server.py — ODIA TTS Production Server (FIXED)
 import os, asyncio, tempfile, logging, json
 from typing import Optional
 from datetime import datetime
@@ -15,8 +15,6 @@ ENV = os.getenv("ENV", "production")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 TTS_VOICE_DEFAULT = os.getenv("TTS_VOICE", "en-NG-EzinneNeural")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
 
 logging.basicConfig(
     level=getattr(logging, LOG_LEVEL, logging.INFO),
@@ -30,7 +28,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# CORS (tighten allow_origins in production to your domains)
+# CORS for all frontends
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,19 +37,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Lazy OpenAI client
+# ---------- OpenAI Client (FIXED - no proxies) ----------
 _oai = None
+
 def get_openai_client():
     global _oai
+    if _oai is False:  # Already tried and failed
+        return None
     if _oai is None and OPENAI_API_KEY:
         try:
             from openai import OpenAI
+            # CRITICAL: Only pass api_key, nothing else
             _oai = OpenAI(api_key=OPENAI_API_KEY)
-            log.info("✅ OpenAI client initialized")
+            log.info("✅ OpenAI client initialized successfully")
         except Exception as e:
             log.error(f"❌ OpenAI init failed: {e}")
-            _oai = False
-    return _oai if _oai else None
+            _oai = False  # Prevent retry
+    return _oai
 
 # ---------- Models ----------
 class AgentIn(BaseModel):
@@ -66,24 +68,23 @@ class AgentOut(BaseModel):
     error: Optional[str] = None
     timestamp: str
 
-# ---------- Middleware for logging ----------
+# ---------- Request Logging ----------
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start_time = datetime.now()
     response = await call_next(request)
     latency_ms = int((datetime.now() - start_time).total_seconds() * 1000)
-    log_data = {
+    log.info(json.dumps({
         "level": "INFO",
         "method": request.method,
         "path": request.url.path,
         "status": response.status_code,
         "latency_ms": latency_ms
-    }
-    log.info(json.dumps(log_data))
+    }))
     return response
 
 # ---------- Routes ----------
-@app.get("/", response_class=JSONResponse)
+@app.get("/")
 def root():
     return {
         "service": "ODIA TTS Server",
@@ -107,6 +108,7 @@ def health():
     if OPENAI_API_KEY:
         client = get_openai_client()
         openai_status = "ready" if client else "failed"
+    
     return {
         "status": "ok",
         "voice": TTS_VOICE_DEFAULT,
@@ -117,69 +119,103 @@ def health():
 
 @app.get("/speak")
 async def speak(
-    text: str = Query(..., min_length=1, max_length=5000, description="Text to speak"),
-    voice: Optional[str] = Query(None, description="Edge voice name"),
-    rate: Optional[str] = Query("+0%", description="Speech rate (+/-X%)"),
-    volume: Optional[str] = Query("+0%", description="Volume level (+/-X%)"),
+    text: str = Query(..., min_length=1, max_length=5000),
+    voice: Optional[str] = Query(None),
+    rate: Optional[str] = Query(None),
+    volume: Optional[str] = Query(None),
 ):
+    """Generate MP3 using Edge TTS"""
     voice_name = (voice or TTS_VOICE_DEFAULT).strip()
-    rate = rate if rate and rate != "0%" else "+0%"
-    volume = volume if volume and volume != "0%" else "+0%"
+    
+    # Fix rate/volume format for Edge TTS
+    if not rate or rate == "0%":
+        rate = "+0%"
+    if not volume or volume == "0%":
+        volume = "+0%"
+    
     try:
-        with tempfile.NamedTemporaryFile(prefix="odia_", suffix=".mp3", delete=False) as tmp:
+        # Create temp file
+        with tempfile.NamedTemporaryFile(
+            prefix="odia_", 
+            suffix=".mp3", 
+            delete=False
+        ) as tmp:
             tmp_path = tmp.name
-        log.info(f"TTS: voice={voice_name}, text_len={len(text)}, rate={rate}, volume={volume}")
-        communicate = edge_tts.Communicate(text=text, voice=voice_name, rate=rate, volume=volume)
+        
+        log.info(f"TTS: voice={voice_name}, len={len(text)}")
+        
+        # Generate speech
+        communicate = edge_tts.Communicate(
+            text=text,
+            voice=voice_name,
+            rate=rate,
+            volume=volume
+        )
         await communicate.save(tmp_path)
-        headers = {
-            "Cache-Control": "no-store",
-            "Content-Disposition": 'inline; filename="speech.mp3"',
-            "X-Voice": voice_name,
-        }
-        return FileResponse(tmp_path, media_type="audio/mpeg", headers=headers)
+        
+        # Return audio file
+        return FileResponse(
+            tmp_path,
+            media_type="audio/mpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": 'inline; filename="speech.mp3"'
+            }
+        )
+        
     except Exception as e:
         log.error(f"TTS failed: {e}")
-        raise HTTPException(status_code=500, detail={"error": "TTS generation failed", "message": str(e)})
+        raise HTTPException(500, detail=str(e))
 
 @app.post("/agent", response_model=AgentOut)
 async def agent(body: AgentIn):
+    """AI agent with echo fallback"""
     user_msg = (body.message or body.text or "").strip()
     agent_type = body.agent or "lexi"
+    
     if not user_msg:
-        raise HTTPException(status_code=422, detail="Either 'message' or 'text' field is required")
+        raise HTTPException(422, detail="'message' or 'text' required")
+    
+    # Try OpenAI
     client = get_openai_client()
-    error_msg = None
+    
     if client:
         try:
             system_prompts = {
-                "lexi": "You are Agent Lexi from ODIA.dev, Nigeria's WhatsApp business automation assistant. Be concise, warm, and helpful in Nigerian English.",
+                "lexi": "You are Agent Lexi from ODIA.dev, Nigeria's WhatsApp automation assistant. Be warm, concise, helpful.",
                 "miss": "You are Agent MISS from Mudiame University. Provide clear academic support.",
-                "atlas": "You are Agent Atlas, ODIA's luxury concierge. Be sophisticated and precise.",
-                "legal": "You are Miss Legal, ODIA's legal assistant. Be accurate and professional."
+                "atlas": "You are Agent Atlas, ODIA's luxury concierge. Be sophisticated.",
+                "legal": "You are Miss Legal, ODIA's legal assistant. Be precise."
             }
-            system_content = system_prompts.get(agent_type, system_prompts["lexi"])
-            from openai import APIConnectionError, RateLimitError
-            resp = client.chat.completions.create(
+            
+            response = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": system_content},
+                    {"role": "system", "content": system_prompts.get(agent_type, system_prompts["lexi"])},
                     {"role": "user", "content": user_msg}
                 ],
                 temperature=0.7,
-                max_tokens=200,
-                timeout=10.0
+                max_tokens=200
             )
-            reply = (resp.choices[0].message.content or "").strip()
-            if not reply:
-                raise ValueError("Empty response from OpenAI")
-            return AgentOut(reply=reply, mode="ai", agent=agent_type, timestamp=datetime.utcnow().isoformat())
+            
+            reply = response.choices[0].message.content.strip()
+            
+            return AgentOut(
+                reply=reply,
+                mode="ai",
+                agent=agent_type,
+                timestamp=datetime.utcnow().isoformat()
+            )
+            
         except Exception as e:
-            log.error(f"OpenAI error: {type(e).__name__}: {e}")
-            error_msg = f"ai_error: {type(e).__name__}"
+            log.error(f"OpenAI error: {e}")
+            error_msg = str(e)[:100]
     else:
         error_msg = "openai_not_configured"
+    
+    # Fallback to echo
     return AgentOut(
-        reply=user_msg,  # echo
+        reply=f"[Echo] {user_msg}",
         mode="echo",
         agent=agent_type,
         error=error_msg,
@@ -188,9 +224,11 @@ async def agent(body: AgentIn):
 
 @app.post("/speak-agent")
 async def speak_agent(body: AgentIn):
+    """Get AI response and return as audio"""
     agent_response = await agent(body)
-    return await speak(text=agent_response.reply, voice=TTS_VOICE_DEFAULT)
+    return await speak(text=agent_response.reply)
 
+# ---------- Main ----------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
