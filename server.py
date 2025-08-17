@@ -1,185 +1,127 @@
-#!/usr/bin/env python3
-import asyncio
-import io
-import json
-import logging
-import os
-import time
+# server.py — ODIA TTS (Render-ready)
+import os, asyncio, tempfile, logging
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse, PlainTextResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from pydantic import BaseModel, Field
+
 import edge_tts
+from openai import OpenAI
 
-# Optional OpenAI agent (echo fallback if no key)
+# ---------- Config ----------
+ENV = os.getenv("ENV", "production")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+TTS_VOICE_DEFAULT = os.getenv("TTS_VOICE", "en-NG-EzinneNeural")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", "en-NG-EzinneNeural")
 
-app = FastAPI(title="ODIA TTS", version="1.0.0")
-
-# CORS (allow all origins by default; tighten if you have a specific frontend domain)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "HEAD", "OPTIONS"],
-    allow_headers=["*"],
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(levelname)s [%(asctime)s] %(message)s",
 )
+log = logging.getLogger("odia-tts")
 
-# Simple JSON logger
-logger = logging.getLogger("uvicorn.error")
+app = FastAPI(title="ODIA TTS server")
 
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    start = time.time()
+# OpenAI client (created only if key exists)
+_oai: Optional[OpenAI] = None
+if OPENAI_API_KEY:
     try:
-        response = await call_next(request)
-        latency_ms = int((time.time() - start) * 1000)
-        logger.info(json.dumps({
-            "level": "INFO",
-            "method": request.method,
-            "path": request.url.path,
-            "status": response.status_code,
-            "latency_ms": latency_ms
-        }))
-        return response
+        _oai = OpenAI(api_key=OPENAI_API_KEY)
+        log.info("OpenAI client initialized")
     except Exception as e:
-        latency_ms = int((time.time() - start) * 1000)
-        logger.error(json.dumps({
-            "level": "ERROR",
-            "method": request.method,
-            "path": request.url.path,
-            "error": str(e),
-            "latency_ms": latency_ms
-        }))
-        raise
+        log.exception("Failed to init OpenAI: %s", e)
+else:
+    log.warning("OPENAI_API_KEY not set: /agent will run in 'echo' mode")
 
-# In-memory IP rate limit (token bucket-ish). Good enough for single-instance Render.
-RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
-_buckets = {}  # ip -> (tokens, last_ts)
+# ---------- Models ----------
+class AgentIn(BaseModel):
+    # accept either "message" (preferred) or "text" for flexibility
+    message: Optional[str] = Field(None, description="User message")
+    text:    Optional[str] = Field(None, description="Alias of message")
 
-def _allow(ip: str) -> bool:
-    now = time.time()
-    tokens, last = _buckets.get(ip, (RATE_LIMIT_PER_MIN, now))
-    # Refill
-    elapsed = now - last
-    refill = elapsed * (RATE_LIMIT_PER_MIN / 60.0)
-    tokens = min(RATE_LIMIT_PER_MIN, tokens + refill)
-    if tokens < 1:
-        _buckets[ip] = (tokens, now)
-        return False
-    _buckets[ip] = (tokens - 1, now)
-    return True
+class AgentOut(BaseModel):
+    reply: str
+    mode: str
+    error: Optional[str] = None
 
-def _normalize_percent(v: Optional[str], default="+0%") -> str:
-    """
-    Edge TTS expects strings like '+0%', '-5%', '+10%'.
-    Accepts '0', '0%', '+0', '+0%', '-5', '-5%', '10', '10%' etc.
-    """
-    if not v or v.strip() == "":
-        return default
-    s = v.strip().replace("%%", "%")  # handle accidental double-encoding
-    if s.endswith("%"):
-        s = s[:-1]
-    try:
-        # allow floats but round to int as edge-tts expects int percents
-        val = int(float(s))
-    except ValueError:
-        # As a last resort, if exactly '0%' return '+0%'
-        return default
-    sign = "+" if val >= 0 else ""
-    return f"{sign}{val}%"
-    
+# ---------- Routes ----------
 @app.get("/", response_class=PlainTextResponse)
-async def root():
+def root():
     return "ODIA TTS server"
 
-@app.head("/")
-async def head_root():
-    return PlainTextResponse("", status_code=200)
-
 @app.get("/health")
-async def health():
-    return {"status": "ok", "voice": DEFAULT_VOICE}
-
-@app.head("/health")
-async def health_head():
-    return PlainTextResponse("", status_code=200)
+def health():
+    return {"status": "ok", "voice": TTS_VOICE_DEFAULT}
 
 @app.get("/speak")
 async def speak(
-    request: Request,
-    text: str = Query(..., min_length=1, description="Text to synthesize"),
-    voice: str = Query(DEFAULT_VOICE, description="Microsoft voice name (Edge TTS)"),
-    rate: Optional[str] = Query(None, description="e.g. '+0%' or '-5%' (0 also ok)"),
-    volume: Optional[str] = Query(None, description="e.g. '+0%' or '-5%' (0 also ok)"),
+    text: str = Query(..., min_length=1, description="Text to speak"),
+    voice: Optional[str] = Query(None, description="Edge voice name"),
 ):
-    client_ip = request.client.host if request.client else "unknown"
-    if not _allow(client_ip):
-        raise HTTPException(status_code=429, detail="Too Many Requests")
-    # Normalize rate/volume to the exact format Edge TTS wants
-    rate_fmt = _normalize_percent(rate, default="+0%")
-    vol_fmt = _normalize_percent(volume, default="+0%")
+    """
+    Generate MP3 using Microsoft Edge TTS and return it inline.
+    """
+    voice_name = (voice or TTS_VOICE_DEFAULT).strip()
+    if not voice_name:
+        voice_name = "en-NG-EzinneNeural"
+
+    # generate into a temp file then return it
     try:
-        communicate = edge_tts.Communicate(text, voice=voice, rate=rate_fmt, volume=vol_fmt)
-        # Gather audio chunks and return a proper MP3 stream
-        mp3_buffer = io.BytesIO()
-        async for chunk in communicate.stream():
-            if chunk["type"] == "audio":
-                mp3_buffer.write(chunk["data"])
-            elif chunk["type"] == "WordBoundary":
-                pass  # ignore markers
-        mp3_buffer.seek(0)
+        tmp = tempfile.NamedTemporaryFile(prefix="odia_", suffix=".mp3", delete=False)
+        tmp_path = tmp.name
+        tmp.close()
+
+        log.info("TTS voice=%s text_len=%d", voice_name, len(text))
+        communicate = edge_tts.Communicate(text=text, voice=voice_name)
+        await communicate.save(tmp_path)
+
         headers = {
             "Cache-Control": "no-store",
-            "Content-Disposition": 'inline; filename="speech.mp3"',
+            "content-disposition": 'inline; filename="speech.mp3"',
         }
-        return StreamingResponse(mp3_buffer, media_type="audio/mpeg", headers=headers)
-    except edge_tts.exceptions.NoAudioReceived as e:
-        raise HTTPException(status_code=502, detail=f"Edge TTS returned no audio: {e}")
+        return FileResponse(tmp_path, media_type="audio/mpeg", headers=headers)
     except Exception as e:
-        # Ensure we always return JSON, not a broken mp3
-        raise HTTPException(status_code=500, detail=f"internal_error: {e}")
+        log.exception("TTS failed: %s", e)
+        raise HTTPException(status_code=500, detail="TTS generation failed")
 
-# ---- Agent (optional OpenAI) ----
-class Msg(BaseModel):
-    message: str
-    apiKey: Optional[str] = None  # allow passing key in body (dev/testing)
-
-@app.post("/agent")
-async def agent(body: Msg, request: Request):
-    client_ip = request.client.host if request.client else "unknown"
-    if not _allow(client_ip):
-        raise HTTPException(status_code=429, detail="Too Many Requests")
-
-    user_msg = (body.message or "").strip()
+@app.post("/agent", response_model=AgentOut)
+def agent(body: AgentIn):
+    """
+    Lightweight agent: calls OpenAI when key is present; otherwise echoes.
+    """
+    user_msg = (body.message or body.text or "").strip()
     if not user_msg:
-        raise HTTPException(status_code=400, detail="message required")
+        # FastAPI will already return 422, but be explicit:
+        raise HTTPException(status_code=422, detail="Field 'message' or 'text' is required")
 
-    api_key = (body.apiKey or OPENAI_API_KEY).strip()
-    if not api_key:
-        # Echo fallback if no key configured
-        return {"reply": user_msg, "mode": "echo"}
+    # Echo fallback when key missing OR client init failed
+    if not _oai:
+        return AgentOut(reply=user_msg, mode="echo", error="openai_not_configured")
 
-    # Lazy import so the package isn't required if you only use echo
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
+        # Use a stable, inexpensive model
+        resp = _oai.chat.completions.create(
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a concise helpful Nigerian customer support assistant."},
+                {"role": "system", "content": "You are Lexi, a friendly Nigerian voice AI assistant."},
                 {"role": "user", "content": user_msg},
             ],
             temperature=0.6,
-            max_tokens=300,
+            max_tokens=180,
         )
         reply = (resp.choices[0].message.content or "").strip()
-        return {"reply": reply, "mode": "openai"}
+        if not reply:
+            raise RuntimeError("Empty reply from OpenAI")
+        return AgentOut(reply=reply, mode="ai")
     except Exception as e:
-        # Fallback to echo on any OpenAI error
-        logger.error(json.dumps({"level": "ERROR", "path": "/agent", "error": str(e)}))
-        return {"reply": user_msg, "mode": "echo", "error": "openai_failed"}
+        # Don’t crash; surface the reason and return echo so the UX still works.
+        err = f"openai_failed: {type(e).__name__}"
+        log.exception("OpenAI error: %s", e)
+        return AgentOut(reply=user_msg, mode="echo", error=err)
+
+# ---------- Local dev run ----------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("server:app", host="0.0.0.0", port=port)
